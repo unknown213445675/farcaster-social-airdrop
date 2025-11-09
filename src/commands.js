@@ -3,6 +3,7 @@ import { ethers } from "ethers";
 import { createObjectCsvWriter } from "csv-writer";
 import fs from "fs";
 import path from "path";
+import readline from "readline";
 
 // Note: The old fetch command is deprecated
 export async function fetchCastsHandler(argv) {
@@ -58,18 +59,348 @@ async function hasElizaOSToken(walletAddress, tokenAddress) {
   return false;
 }
 
-// Search for casts containing specific text (helper function - not currently used)
-async function searchCastsWithText({ apiKey, searchText, limit = 100 }) {
-  const client = getClient(apiKey);
+// Helper to ask user for confirmation
+function askConfirmation(question) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.toLowerCase() === 'yes' || answer.toLowerCase() === 'y');
+    });
+  });
+}
+
+// Send airdrop - actually transfer tokens to eligible wallets
+export async function sendAirdropHandler(argv) {
+  console.log("╔═══════════════════════════════════════════════════════════╗");
+  console.log("║              Airdrop Token Sender (LIVE)                 ║");
+  console.log("╚═══════════════════════════════════════════════════════════╝");
+  console.log(`\n⚠️  WARNING: This will send REAL tokens using REAL funds!\n`);
+  console.log(`📋 Configuration:`);
+  console.log(`   Input CSV: ${argv.input}`);
+  console.log(`   Token address: ${argv.tokenAddress}`);
+  console.log(`   Dry run: ${argv.dryRun ? 'YES (safe)' : 'NO (LIVE TOKENS WILL BE SENT!)'}`);
+  console.log(`   Started: ${new Date().toLocaleString()}\n`);
   
   try {
-    const result = await client.searchCasts({
-      q: searchText,
-      limit: limit,
-    });
-    return result.casts || [];
+    // Check private key
+    const privateKey = process.env.PRIVATE_KEY;
+    if (!privateKey) {
+      console.error(`❌ PRIVATE_KEY not found in .env file!\n`);
+      return;
+    }
+    
+    // Read distribution CSV
+    if (!fs.existsSync(argv.input)) {
+      console.error(`❌ Input file not found: ${argv.input}\n`);
+      return;
+    }
+    
+    const csvContent = fs.readFileSync(argv.input, 'utf8');
+    const lines = csvContent.split('\n');
+    
+    if (lines.length < 2) {
+      console.error(`❌ Input CSV is empty!\n`);
+      return;
+    }
+    
+    // Parse CSV
+    const distributions = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      
+      const columns = line.split(',');
+      const holder = columns[0];
+      const amount = columns[1];
+      
+      if (holder && holder.startsWith('0x') && amount) {
+        distributions.push({
+          address: holder,
+          amount: amount,
+        });
+      }
+    }
+    
+    console.log(`✓ Loaded ${distributions.length} addresses from CSV\n`);
+    
+    // Setup wallet and contract
+    const rpcUrl = BASE_RPC_URLS[0]; // Use primary RPC
+    const provider = new ethers.JsonRpcProvider(rpcUrl);
+    const wallet = new ethers.Wallet(privateKey, provider);
+    
+    console.log(`💼 Sender Wallet: ${wallet.address}`);
+    
+    // Get token contract
+    const tokenContract = new ethers.Contract(
+      argv.tokenAddress,
+      [
+        "function transfer(address to, uint256 amount) returns (bool)",
+        "function balanceOf(address owner) view returns (uint256)",
+        "function decimals() view returns (uint8)",
+        "function symbol() view returns (string)",
+      ],
+      wallet
+    );
+    
+    // Get token info
+    const [decimals, symbol, senderBalance] = await Promise.all([
+      tokenContract.decimals(),
+      tokenContract.symbol(),
+      tokenContract.balanceOf(wallet.address),
+    ]);
+    
+    console.log(`🪙  Token: ${symbol}`);
+    console.log(`   Decimals: ${decimals}`);
+    console.log(`   Your balance: ${ethers.formatUnits(senderBalance, decimals)} ${symbol}\n`);
+    
+    // Calculate total needed
+    const amountPerWallet = ethers.parseUnits(distributions[0].amount, decimals);
+    const totalNeeded = amountPerWallet * BigInt(distributions.length);
+    
+    console.log(`📊 Airdrop Summary:`);
+    console.log(`   Recipients: ${distributions.length}`);
+    console.log(`   Amount each: ${distributions[0].amount} ${symbol}`);
+    console.log(`   Total needed: ${ethers.formatUnits(totalNeeded, decimals)} ${symbol}`);
+    console.log(`   Your balance: ${ethers.formatUnits(senderBalance, decimals)} ${symbol}`);
+    
+    if (senderBalance < totalNeeded) {
+      console.error(`\n❌ Insufficient balance!`);
+      console.error(`   Need: ${ethers.formatUnits(totalNeeded, decimals)} ${symbol}`);
+      console.error(`   Have: ${ethers.formatUnits(senderBalance, decimals)} ${symbol}`);
+      console.error(`   Short: ${ethers.formatUnits(totalNeeded - senderBalance, decimals)} ${symbol}\n`);
+      return;
+    }
+    
+    console.log(`   ✓ Sufficient balance\n`);
+    
+    // Check for progress file
+    const progressFile = `.cache/airdrop_progress_${argv.tokenAddress}.json`;
+    let sentAddresses = new Set();
+    
+    if (fs.existsSync(progressFile)) {
+      const progress = JSON.parse(fs.readFileSync(progressFile, 'utf8'));
+      sentAddresses = new Set(progress.sent || []);
+      console.log(`📦 Loaded progress: ${sentAddresses.size} already sent\n`);
+    }
+    
+    const remaining = distributions.filter(d => !sentAddresses.has(d.address));
+    
+    if (remaining.length === 0) {
+      console.log(`✓ All addresses have already been sent to!\n`);
+      return;
+    }
+    
+    console.log(`📤 Will send to ${remaining.length} addresses\n`);
+    
+    // DRY RUN MODE
+    if (argv.dryRun) {
+      console.log(`🔍 DRY RUN MODE - No tokens will be sent\n`);
+      console.log(`First 5 transactions that WOULD be sent:`);
+      remaining.slice(0, 5).forEach((dist, i) => {
+        console.log(`  ${i + 1}. ${dist.address} → ${dist.amount} ${symbol}`);
+      });
+      if (remaining.length > 5) {
+        console.log(`  ... and ${remaining.length - 5} more`);
+      }
+      console.log(`\n✓ Dry run complete. Use --no-dry-run to send for real.\n`);
+      return;
+    }
+    
+    // LIVE MODE - Ask for confirmation
+    console.log(`⚠️  ⚠️  ⚠️  LIVE MODE - REAL TOKENS WILL BE SENT! ⚠️  ⚠️  ⚠️\n`);
+    console.log(`This will:`);
+    console.log(`  - Send ${distributions[0].amount} ${symbol} to ${remaining.length} addresses`);
+    console.log(`  - Use ${ethers.formatUnits(totalNeeded, decimals)} ${symbol} from your wallet`);
+    console.log(`  - Cost gas fees (estimated ~${remaining.length * 0.0001} ETH)\n`);
+    
+    const confirmed = await askConfirmation(`Type 'yes' to confirm and send tokens: `);
+    
+    if (!confirmed) {
+      console.log(`\n❌ Cancelled. No tokens sent.\n`);
+      return;
+    }
+    
+    console.log(`\n🚀 Starting airdrop...\n`);
+    
+    // Send tokens
+    let successCount = 0;
+    let failCount = 0;
+    const failures = [];
+    
+    for (let i = 0; i < remaining.length; i++) {
+      const dist = remaining[i];
+      
+      try {
+        console.log(`[${i + 1}/${remaining.length}] Sending to ${dist.address}...`);
+        
+        const tx = await tokenContract.transfer(dist.address, amountPerWallet);
+        console.log(`  ⏳ Transaction sent: ${tx.hash}`);
+        
+        const receipt = await tx.wait();
+        console.log(`  ✓ Confirmed in block ${receipt.blockNumber}`);
+        
+        successCount++;
+        sentAddresses.add(dist.address);
+        
+        // Save progress every 10 transactions
+        if (successCount % 10 === 0) {
+          fs.writeFileSync(
+            progressFile,
+            JSON.stringify({ sent: Array.from(sentAddresses), timestamp: new Date().toISOString() }),
+            'utf8'
+          );
+          console.log(`  💾 Progress saved (${successCount} sent)\n`);
+        }
+        
+        // Small delay between transactions
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+      } catch (error) {
+        failCount++;
+        console.error(`  ✗ Failed: ${error.message}`);
+        failures.push({ address: dist.address, error: error.message });
+      }
+    }
+    
+    // Save final progress
+    fs.writeFileSync(
+      progressFile,
+      JSON.stringify({ 
+        sent: Array.from(sentAddresses), 
+        timestamp: new Date().toISOString(),
+        complete: failCount === 0
+      }),
+      'utf8'
+    );
+    
+    // Final summary
+    console.log(`\n╔═══════════════════════════════════════════════════════════╗`);
+    console.log(`║                  AIRDROP COMPLETE                        ║`);
+    console.log(`╚═══════════════════════════════════════════════════════════╝`);
+    console.log(`\n📊 Results:`);
+    console.log(`   ✓ Successful: ${successCount}`);
+    console.log(`   ✗ Failed: ${failCount}`);
+    console.log(`   Total sent: ${ethers.formatUnits(amountPerWallet * BigInt(successCount), decimals)} ${symbol}\n`);
+    
+    if (failures.length > 0) {
+      console.log(`❌ Failed addresses:`);
+      failures.forEach(f => console.log(`   ${f.address}: ${f.error}`));
+      console.log(``);
+    }
+    
   } catch (error) {
-    console.error("Error searching casts:", error.message);
+    console.error("\n❌ Error:", error.message);
+    throw error;
+  }
+}
+
+// Export airdrop list - convert CSV to holders/amounts format
+export async function exportAirdropHandler(argv) {
+  console.log("╔═══════════════════════════════════════════════════════════╗");
+  console.log("║           Airdrop Distribution List Exporter             ║");
+  console.log("╚═══════════════════════════════════════════════════════════╝");
+  console.log(`\n📋 Configuration:`);
+  console.log(`   Input CSV: ${argv.input}`);
+  console.log(`   Output: ${argv.output}`);
+  console.log(`   Amount per wallet: ${argv.amount}`);
+  console.log(`   Started: ${new Date().toLocaleString()}\n`);
+  
+  try {
+    // Read the input CSV
+    if (!fs.existsSync(argv.input)) {
+      console.error(`\n❌ Input file not found: ${argv.input}`);
+      console.error(`   Make sure you've run social-airdrop first!\n`);
+      return;
+    }
+    
+    const csvContent = fs.readFileSync(argv.input, 'utf8');
+    const lines = csvContent.split('\n');
+    
+    if (lines.length < 2) {
+      console.error(`\n❌ Input CSV is empty or has no data!\n`);
+      return;
+    }
+    
+    // Parse CSV (skip header)
+    const holders = [];
+    let excludedNoAddress = 0;
+    let excludedBots = 0;
+    
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      
+      const columns = line.split(',');
+      // Columns: 0=Username, 1=DisplayName, 2=FID, 3=WalletAddress, 4=Reason, 5=FollowerCount
+      const fid = parseInt(columns[2]);
+      const walletAddress = columns[3];
+      const followerCount = parseInt(columns[5]) || 0;
+      
+      // Filter out likely bots/spam
+      if (fid > 1000000 && followerCount < 5) {
+        excludedBots++;
+        continue;
+      }
+      
+      // Only include wallets that have valid addresses
+      if (walletAddress && 
+          walletAddress !== 'NO_VERIFIED_ADDRESS' && 
+          walletAddress.startsWith('0x') &&
+          walletAddress.length === 42) {
+        holders.push(walletAddress);
+      } else {
+        excludedNoAddress++;
+      }
+    }
+    
+    console.log(`✓ Parsed ${holders.length} valid wallet addresses from ${lines.length - 1} records`);
+    console.log(`   Excluded: ${excludedNoAddress} (no address), ${excludedBots} (bots/spam - FID>1M & followers<5)\n`);
+    
+    if (holders.length === 0) {
+      console.error(`\n❌ No valid wallet addresses found in input CSV!\n`);
+      return;
+    }
+    
+    // Generate airdrop CSV
+    const airdropCsv = createObjectCsvWriter({
+      path: argv.output,
+      header: [
+        { id: 'holder', title: 'holders' },
+        { id: 'amount', title: 'amounts' },
+      ],
+    });
+    
+    const airdropData = holders.map(holder => ({
+      holder: holder,
+      amount: argv.amount,
+    }));
+    
+    await airdropCsv.writeRecords(airdropData);
+    
+    console.log(`\n✓ Airdrop distribution list created!`);
+    console.log(`   File: ${argv.output}`);
+    console.log(`   Total wallets: ${holders.length}`);
+    console.log(`   Amount per wallet: ${argv.amount}`);
+    console.log(`   Total tokens needed: ${holders.length * argv.amount}\n`);
+    
+    // Show sample
+    console.log(`📄 Sample (first 5 entries):`);
+    console.log(`holders\tamounts`);
+    airdropData.slice(0, 5).forEach(entry => {
+      console.log(`${entry.holder}\t${entry.amount}`);
+    });
+    
+    if (holders.length > 5) {
+      console.log(`... and ${holders.length - 5} more`);
+    }
+    
+  } catch (error) {
+    console.error("\n❌ Error:", error.message);
     throw error;
   }
 }
@@ -243,13 +574,22 @@ function extractUniqueUsers(casts) {
   console.log("\n👥 Stage 2: Extracting unique users...");
   console.log(`   Total casts: ${casts.length}`);
   console.log(`   Deduplicating by user (keeping one cast per user)...`);
+  console.log(`   Filtering: FID > 1,000,000 or followers < 5 (likely bots/spam)`);
   
   const usersMap = new Map();
   let duplicateCasts = 0;
+  let filteredBots = 0;
   
   for (const cast of casts) {
     if (cast.author && cast.author.username) {
       const fid = cast.author.fid;
+      const followerCount = cast.author.follower_count || 0;
+      
+      // Filter out likely bots/spam accounts
+      if (fid > 1000000 && followerCount < 5) {
+        filteredBots++;
+        continue;
+      }
       
       if (!usersMap.has(fid)) {
         usersMap.set(fid, {
@@ -257,7 +597,7 @@ function extractUniqueUsers(casts) {
           fid: fid,
           displayName: cast.author.display_name || cast.author.username,
           verifiedAddresses: cast.author.verified_addresses || {},
-          followerCount: cast.author.follower_count || 0,
+          followerCount: followerCount,
           profileImage: cast.author.pfp_url || "",
         });
       } else {
@@ -267,7 +607,8 @@ function extractUniqueUsers(casts) {
   }
   
   const users = Array.from(usersMap.values());
-  console.log(`✓ Found ${users.length} unique users (removed ${duplicateCasts} duplicate casts)`);
+  console.log(`✓ Found ${users.length} unique users`);
+  console.log(`   Removed: ${duplicateCasts} duplicate casts, ${filteredBots} likely bots/spam`);
   
   return users;
 }

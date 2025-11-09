@@ -2,7 +2,7 @@ import "dotenv/config";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 
-import { fetchCastsHandler, elizaOSAirdropHandler } from "./commands.js";
+import { fetchCastsHandler, elizaOSAirdropHandler, exportAirdropHandler, sendAirdropHandler } from "./commands.js";
 
 yargs(hideBin(process.argv))
   .version(false)
@@ -81,6 +81,50 @@ yargs(hideBin(process.argv))
       },
     },
     handler: elizaOSAirdropHandler,
+  })
+  .command({
+    command: "export-airdrop",
+    describe: "Export eligible users CSV to airdrop distribution format (holders/amounts)",
+    builder: {
+      input: {
+        describe: "Input CSV file from social-airdrop command",
+        type: "string",
+        demandOption: true,
+      },
+      output: {
+        default: "airdrop_distribution.csv",
+        describe: "Output CSV filename for airdrop distribution",
+        type: "string",
+      },
+      amount: {
+        default: 420,
+        describe: "Amount of tokens to airdrop per wallet",
+        type: "number",
+      },
+    },
+    handler: exportAirdropHandler,
+  })
+  .command({
+    command: "send-airdrop",
+    describe: "Send tokens to addresses in distribution CSV (CAREFUL - sends real tokens!)",
+    builder: {
+      input: {
+        describe: "Distribution CSV file (holders,amounts format)",
+        type: "string",
+        demandOption: true,
+      },
+      tokenAddress: {
+        default: "0xea17df5cf6d172224892b5477a16acb111182478",
+        describe: "Token contract address on Base chain",
+        type: "string",
+      },
+      dryRun: {
+        default: true,
+        describe: "Dry run mode (doesn't actually send tokens)",
+        type: "boolean",
+      },
+    },
+    handler: sendAirdropHandler,
   })
   .demandCommand(1, "You must provide at least one command to execute")
   .help().argv;
